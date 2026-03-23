@@ -14,7 +14,10 @@ export const PLATFORM = 'web' as const;
 export const SDK_NAME = 'neptune-sdk-web';
 export const SDK_VERSION = '0.1.0';
 
-export type FetchLike = (input: string, init?: RequestInit) => Promise<{ ok: boolean; status: number }>;
+export type FetchLike = (
+  input: string,
+  init?: RequestInit,
+) => Promise<{ ok: boolean; status: number; json?: () => Promise<unknown> }>;
 
 export const logLevelSchema = z.enum(LOG_LEVELS);
 
@@ -25,6 +28,22 @@ export const sourceOriginSchema = z
     file: z.string().optional(),
     function: z.string().optional(),
     line: z.number().int().optional(),
+  })
+  .strict();
+
+export const gatewayDiscoveryConfigSchema = z
+  .object({
+    enabled: z.boolean().optional(),
+    url: z.string().url().optional(),
+    timeoutMs: z.number().int().positive().max(30_000).optional(),
+  })
+  .strict();
+
+export const gatewayDiscoveryResponseSchema = z
+  .object({
+    host: z.string().min(1),
+    port: z.number().int().min(1).max(65_535),
+    version: z.string().min(1),
   })
   .strict();
 
@@ -50,6 +69,7 @@ export const loggerConfigSchema = z
     deviceId: z.string().min(1),
     baseURL: z.string().url().optional(),
     dsn: z.string().url().optional(),
+    discovery: gatewayDiscoveryConfigSchema.optional(),
     source: sourceOriginSchema.optional(),
     fetch: z.custom<FetchLike>((value) => value === undefined || typeof value === 'function').optional(),
   })
@@ -68,6 +88,8 @@ export const logInputSchema = z
 
 export type LogLevel = z.infer<typeof logLevelSchema>;
 export type SourceOrigin = z.infer<typeof sourceOriginSchema>;
+export type GatewayDiscoveryConfig = z.infer<typeof gatewayDiscoveryConfigSchema>;
+export type GatewayDiscoveryResponse = z.infer<typeof gatewayDiscoveryResponseSchema>;
 export type IngestLogRecord = z.infer<typeof ingestLogRecordSchema>;
 export type LoggerConfig = z.infer<typeof loggerConfigSchema>;
 export type LogInput = z.infer<typeof logInputSchema>;

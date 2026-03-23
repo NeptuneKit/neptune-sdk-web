@@ -1,8 +1,12 @@
 export {
+  gatewayDiscoveryConfigSchema,
+  gatewayDiscoveryResponseSchema,
   LOG_LEVELS,
   PLATFORM,
   SDK_NAME,
   SDK_VERSION,
+  type GatewayDiscoveryConfig,
+  type GatewayDiscoveryResponse,
   type IngestLogRecord,
   type LogInput,
   type LogLevel,

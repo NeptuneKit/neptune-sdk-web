@@ -2,9 +2,12 @@ import {
   SDK_NAME,
   SDK_VERSION,
   PLATFORM,
+  gatewayDiscoveryResponseSchema,
   ingestLogRecordSchema,
   logInputSchema,
   loggerConfigSchema,
+  type GatewayDiscoveryConfig,
+  type GatewayDiscoveryResponse,
   type IngestLogRecord,
   type FetchLike,
   type LogInput,
@@ -14,6 +17,8 @@ import {
 } from './contracts';
 
 const DEFAULT_BASE_URL = 'http://127.0.0.1:18765';
+const DEFAULT_DISCOVERY_PATH = '/v2/gateway/discovery';
+const DEFAULT_DISCOVERY_TIMEOUT_MS = 1_500;
 const DEFAULT_BATCH_SIZE = 50;
 const DEFAULT_FLUSH_INTERVAL_MS = 1_000;
 const DEFAULT_MAX_QUEUE_SIZE = 2_000;
@@ -28,12 +33,17 @@ export type NeptuneLogger = {
 };
 
 export class NeptuneLoggerImpl implements NeptuneLogger {
-  private readonly endpoint: string;
+  private readonly fallbackEndpoint: string;
   private readonly fetcher: FetchLike;
   private readonly source: SourceOrigin;
+  private readonly discovery?: GatewayDiscoveryConfig;
+  private readonly baseURL?: string;
+  private readonly dsn?: string;
   private readonly queue: IngestLogRecord[] = [];
   private flushTimer: TimerHandle | null = null;
   private activeFlush: Promise<void> | null = null;
+  private endpoint: string | null = null;
+  private endpointResolution: Promise<string> | null = null;
   private readonly counters: Omit<LoggerMetricsSnapshot, 'queue_size'> = {
     dropped_overflow: 0,
     enqueued_total: 0,
@@ -44,8 +54,14 @@ export class NeptuneLoggerImpl implements NeptuneLogger {
 
   constructor(config: LoggerConfig) {
     const parsedConfig = loggerConfigSchema.parse(config);
-    this.endpoint = resolveEndpoint(parsedConfig);
     this.fetcher = parsedConfig.fetch ?? defaultFetch;
+    this.fallbackEndpoint = resolveFallbackEndpoint(parsedConfig);
+    this.discovery = parsedConfig.discovery;
+    this.baseURL = parsedConfig.baseURL;
+    this.dsn = parsedConfig.dsn;
+    if (!isDiscoveryEnabled(this.discovery)) {
+      this.endpoint = this.fallbackEndpoint;
+    }
     this.source = {
       sdkName: SDK_NAME,
       sdkVersion: SDK_VERSION,
@@ -128,9 +144,11 @@ export class NeptuneLoggerImpl implements NeptuneLogger {
   }
 
   private async sendBatch(batch: IngestLogRecord[]): Promise<boolean> {
+    const endpoint = await this.resolveEndpoint();
+
     for (let retryIndex = 0; retryIndex <= RETRY_DELAYS_MS.length; retryIndex += 1) {
       try {
-        const response = await this.fetcher(this.endpoint, {
+        const response = await this.fetcher(endpoint, {
           method: 'POST',
           headers: {
             'content-type': 'application/json',
@@ -158,6 +176,31 @@ export class NeptuneLoggerImpl implements NeptuneLogger {
     return false;
   }
 
+  private resolveEndpoint(): Promise<string> {
+    if (this.endpoint) {
+      return Promise.resolve(this.endpoint);
+    }
+
+    if (this.endpointResolution) {
+      return this.endpointResolution;
+    }
+
+    this.endpointResolution = resolveEndpoint({
+      baseURL: this.baseURL,
+      dsn: this.dsn,
+      discovery: this.discovery,
+      fallbackEndpoint: this.fallbackEndpoint,
+      fetcher: this.fetcher,
+    }).then((resolvedEndpoint) => {
+      this.endpoint = resolvedEndpoint;
+      return resolvedEndpoint;
+    });
+
+    return this.endpointResolution.finally(() => {
+      this.endpointResolution = null;
+    });
+  }
+
   private scheduleFlush(): void {
     if (this.flushTimer || this.queue.length === 0) {
       return;
@@ -181,12 +224,71 @@ export class NeptuneLoggerImpl implements NeptuneLogger {
   }
 }
 
-function resolveEndpoint(config: LoggerConfig): string {
+function resolveFallbackEndpoint(config: LoggerConfig): string {
   if (config.dsn) {
     return ensureIngestPath(config.dsn).toString();
   }
 
   return new URL('/v2/logs:ingest', config.baseURL ?? DEFAULT_BASE_URL).toString();
+}
+
+async function resolveEndpoint({
+  baseURL,
+  dsn,
+  discovery,
+  fallbackEndpoint,
+  fetcher,
+}: {
+  baseURL?: string;
+  dsn?: string;
+  discovery?: GatewayDiscoveryConfig;
+  fallbackEndpoint: string;
+  fetcher: FetchLike;
+}): Promise<string> {
+  const discoveryURL = resolveDiscoveryURL({ baseURL, dsn, discovery });
+  if (!discoveryURL) {
+    return fallbackEndpoint;
+  }
+
+  try {
+    const discoveryResponse = await fetchDiscovery(discoveryURL, fetcher, discovery?.timeoutMs);
+    return resolveDiscoveredEndpoint(discoveryURL, discoveryResponse).toString();
+  } catch {
+    return fallbackEndpoint;
+  }
+}
+
+function resolveDiscoveryURL({
+  baseURL,
+  dsn,
+  discovery,
+}: {
+  baseURL?: string;
+  dsn?: string;
+  discovery?: GatewayDiscoveryConfig;
+}): string | null {
+  if (!isDiscoveryEnabled(discovery)) {
+    return null;
+  }
+
+  if (discovery?.url) {
+    return new URL(discovery.url).toString();
+  }
+
+  if (baseURL) {
+    return new URL(DEFAULT_DISCOVERY_PATH, baseURL).toString();
+  }
+
+  if (dsn) {
+    return new URL(DEFAULT_DISCOVERY_PATH, dsn).toString();
+  }
+
+  const sameOrigin = resolveBrowserOrigin();
+  if (sameOrigin) {
+    return new URL(DEFAULT_DISCOVERY_PATH, sameOrigin).toString();
+  }
+
+  return new URL(DEFAULT_DISCOVERY_PATH, DEFAULT_BASE_URL).toString();
 }
 
 function ensureIngestPath(input: string): URL {
@@ -236,10 +338,88 @@ async function defaultFetch(input: string, init?: RequestInit): Promise<Response
   return globalThis.fetch(input, init);
 }
 
+async function fetchDiscovery(
+  discoveryURL: string,
+  fetcher: FetchLike,
+  timeoutMs = DEFAULT_DISCOVERY_TIMEOUT_MS,
+): Promise<GatewayDiscoveryResponse> {
+  const response = await withTimeout(
+    fetcher(discoveryURL),
+    timeoutMs,
+    `gateway discovery timed out after ${timeoutMs}ms`,
+  );
+
+  if (!response.ok) {
+    throw new Error(`gateway discovery failed with HTTP ${response.status}`);
+  }
+
+  if (typeof response.json !== 'function') {
+    throw new Error('gateway discovery response must expose json()');
+  }
+
+  return gatewayDiscoveryResponseSchema.parse(await response.json());
+}
+
+function resolveDiscoveredEndpoint(discoveryURL: string, discovery: GatewayDiscoveryResponse): URL {
+  const url = new URL('/v2/logs:ingest', discoveryURL);
+  url.hostname = normalizeDiscoveredHost(discovery.host, url.hostname);
+  url.port = String(discovery.port);
+  url.search = '';
+  url.hash = '';
+  return url;
+}
+
+function normalizeDiscoveredHost(host: string, fallbackHost: string): string {
+  const normalizedHost = host.startsWith('[') && host.endsWith(']') ? host.slice(1, -1) : host;
+  if (normalizedHost === '0.0.0.0' || normalizedHost === '::') {
+    return fallbackHost;
+  }
+
+  return normalizedHost;
+}
+
+function isDiscoveryEnabled(discovery?: GatewayDiscoveryConfig): boolean {
+  return discovery !== undefined && discovery.enabled !== false;
+}
+
+function resolveBrowserOrigin(): string | null {
+  if (typeof window === 'undefined') {
+    return null;
+  }
+
+  const origin = window.location?.origin;
+  if (!origin || origin === 'null') {
+    return null;
+  }
+
+  return origin;
+}
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => {
     const timer = setTimeout(resolve, ms);
     maybeUnrefTimer(timer);
+  });
+}
+
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, errorMessage: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error(errorMessage));
+    }, timeoutMs);
+
+    maybeUnrefTimer(timer);
+
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
   });
 }
 

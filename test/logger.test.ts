@@ -9,6 +9,7 @@ describe('neptune-sdk-web', () => {
   afterEach(() => {
     vi.useRealTimers();
     vi.restoreAllMocks();
+    vi.unstubAllGlobals();
   });
 
   it('使用 baseURL 将批量日志发送到 /v2/logs:ingest，并对齐 contracts 字段', async () => {
@@ -43,6 +44,122 @@ describe('neptune-sdk-web', () => {
     expect(init.method).toBe('POST');
     expect(init.headers).toEqual({ 'content-type': 'application/json' });
     expect(JSON.parse(String(init.body))).toEqual([record]);
+  });
+
+  it('启用 discovery 后优先使用发现到的 host/port/version 发送日志', async () => {
+    const fetchMock = vi.fn().mockImplementation(async (url: string, init?: RequestInit) => {
+      if (!init?.method) {
+        expect(url).toBe('https://bootstrap.example.com/v2/gateway/discovery');
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            host: 'gateway-discovered.example.com',
+            port: 19421,
+            version: '2.0.0-alpha.1',
+          }),
+        };
+      }
+
+      return { ok: true, status: 202 };
+    });
+
+    const logger = createLogger({
+      baseURL: 'https://bootstrap.example.com/api',
+      discovery: {
+        enabled: true,
+      },
+      appId: 'app.web',
+      sessionId: 'session-001',
+      deviceId: 'device-001',
+      fetch: fetchMock,
+    });
+
+    logger.log({
+      level: 'info',
+      message: 'via discovery',
+      category: 'transport',
+    });
+
+    await logger.flush();
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock.mock.calls[1]?.[0]).toBe('https://gateway-discovered.example.com:19421/v2/logs:ingest');
+    expect(fetchMock.mock.calls[1]?.[1]?.method).toBe('POST');
+  });
+
+  it('discovery 失败后按 dsn -> baseURL -> 默认 loopback 回退', async () => {
+    const fetchMock = vi.fn().mockImplementation(async (_url: string, init?: RequestInit) => {
+      if (!init?.method) {
+        throw new Error('discovery offline');
+      }
+
+      return { ok: true, status: 202 };
+    });
+
+    const logger = createLogger({
+      baseURL: 'https://gateway.example.com/base',
+      dsn: 'https://ingest.example.com/custom',
+      discovery: {
+        enabled: true,
+        url: 'https://bootstrap.example.com/v2/gateway/discovery',
+      },
+      appId: 'app.web',
+      sessionId: 'session-001',
+      deviceId: 'device-001',
+      fetch: fetchMock,
+    });
+
+    logger.log({
+      level: 'warning',
+      message: 'fallback to dsn',
+      category: 'transport',
+    });
+
+    await logger.flush();
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock.mock.calls[0]?.[0]).toBe('https://bootstrap.example.com/v2/gateway/discovery');
+    expect(fetchMock.mock.calls[1]?.[0]).toBe('https://ingest.example.com/custom');
+  });
+
+  it('浏览器环境默认只尝试 same-origin discovery，不做 mDNS 扫描', async () => {
+    vi.stubGlobal('window', {
+      location: {
+        origin: 'https://app.example.com',
+      },
+    });
+
+    const fetchMock = vi.fn().mockImplementation(async (url: string, init?: RequestInit) => {
+      if (!init?.method) {
+        expect(url).toBe('https://app.example.com/v2/gateway/discovery');
+        throw new Error('same-origin discovery unavailable');
+      }
+
+      return { ok: true, status: 202 };
+    });
+
+    const logger = createLogger({
+      discovery: {
+        enabled: true,
+      },
+      appId: 'app.web',
+      sessionId: 'session-001',
+      deviceId: 'device-001',
+      fetch: fetchMock,
+    });
+
+    logger.log({
+      level: 'info',
+      message: 'browser fallback',
+      category: 'transport',
+    });
+
+    await logger.flush();
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock.mock.calls[0]?.[0]).toBe('https://app.example.com/v2/gateway/discovery');
+    expect(fetchMock.mock.calls[1]?.[0]).toBe('http://127.0.0.1:18765/v2/logs:ingest');
   });
 
   it('队列超过 2000 时丢弃最旧日志并累计 dropped_overflow', async () => {
