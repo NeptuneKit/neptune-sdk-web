@@ -188,6 +188,27 @@ npm test
 npm run build
 ```
 
+## Demo 冒烟
+
+仓库内提供了一个最小 Node demo，用于验证 `Web SDK -> Gateway -> 查询接口` 链路是否可用：
+
+```bash
+npm run build
+NEPTUNE_GATEWAY_BASE_URL=http://127.0.0.1:18765 \
+node examples/smoke-demo/run.cjs
+```
+
+脚本会：
+
+- 发送 3 条 `platform=web` 的日志到 `/v2/logs:ingest`
+- 调用 `/v2/logs` 验证按 `appId/sessionId` 可查回
+- 调用 `/v2/sources` 和 `/v2/metrics` 验证聚合快照可读
+
+默认 demo 标识：
+
+- `appId`: `com.neptune.demo.web`
+- `sessionId`: `smoke-<timestamp>`
+
 ## CI 与发包校验
 
 GitHub Actions 会在 `push` 到 `main` 以及所有 `pull_request` 上自动执行：
