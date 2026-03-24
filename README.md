@@ -187,3 +187,16 @@ metrics();
 npm test
 npm run build
 ```
+
+## CI 与发包校验
+
+GitHub Actions 会在 `push` 到 `main` 以及所有 `pull_request` 上自动执行：
+
+```bash
+npm ci
+npm test
+npm run build
+npm pack --dry-run
+```
+
+其中 `npm pack --dry-run` 用于检查 npm 发包内容是否只包含预期产物，当前仓库会随 `dist/` 一起打包。
