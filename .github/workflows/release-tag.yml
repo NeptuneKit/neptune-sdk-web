@@ -1,0 +1,68 @@
+name: Release (Tag)
+
+on:
+  push:
+    tags:
+      - "*"
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: "Release tag (e.g. v1.2.3 or 2026.3.26). Leave empty when dispatching from a tag ref."
+        required: false
+        default: ""
+        type: string
+      draft:
+        description: "Create release as draft"
+        required: false
+        default: false
+        type: boolean
+      prerelease:
+        description: "Mark release as prerelease"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Resolve release tag
+        id: release_tag
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          tag_name="${{ inputs.tag_name }}"
+          if [[ -z "${tag_name}" ]]; then
+            tag_name="${GITHUB_REF_NAME}"
+          fi
+
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" && "${GITHUB_REF_TYPE:-}" != "tag" && -z "${{ inputs.tag_name }}" ]]; then
+            echo "workflow_dispatch from a branch requires inputs.tag_name" >&2
+            exit 1
+          fi
+
+          if [[ ! "${tag_name}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] && [[ ! "${tag_name}" =~ ^[0-9]{4}\.[0-9]{1,2}\.[0-9]{1,2}(\.[0-9]+)?$ ]]; then
+            echo "invalid tag: ${tag_name}" >&2
+            exit 1
+          fi
+
+          printf 'tag_name=%s\n' "${tag_name}" >> "${GITHUB_OUTPUT}"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ steps.release_tag.outputs.tag_name }}
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.release_tag.outputs.tag_name }}
+          generate_release_notes: true
+          draft: ${{ inputs.draft || false }}
+          prerelease: ${{ inputs.prerelease || false }}
